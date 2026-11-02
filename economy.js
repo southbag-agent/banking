@@ -169,19 +169,47 @@ async function charge(repo, account, amount, kind, description) {
 
 export const DAILY_ACCOUNT_FEE_CENTS = 100;
 export const DAILY_ACCOUNT_FEE_DESCRIPTION = 'Daily account maintenance fee';
+export const FROZEN_ACCOUNT_FEE_CENTS = 200;
+export const FROZEN_ACCOUNT_FEE_DESCRIPTION = 'Daily frozen account fee';
 
-// Once per 24 hours of account activity the house takes its cut, on top of
-// whatever the activity itself costs. Uses the same charge path as every
-// other fee: it lands in the ledger and can take the balance negative,
+const utcDayStart = at => Math.floor(at / 86400000) * 86400000;
+
+// Once per UTC day the house takes its cut, whether or not the account is
+// used: $1 for a normal account, $2 for a frozen one. Being frozen stops you
+// moving money, not the meter. The repo charges atomically: the claim, the
+// debit and the ledger row land together or not at all, so the cron sweep
+// and a simultaneous interaction cannot double-charge, a crash cannot mark
+// the fee paid without debiting it, and the balance can still go negative,
 // like any self-respecting fee.
 export async function applyDailyAccountFee(repo, account) {
-  if (!account || account.status !== 'active') return false;
-  if (account.last_account_fee_at && now() - account.last_account_fee_at < 86400000) return false;
+  if (!account) return false;
   const at = now();
-  await charge(repo, account, DAILY_ACCOUNT_FEE_CENTS, 'fee', DAILY_ACCOUNT_FEE_DESCRIPTION);
-  await repo.updateAccount(account.user_id, { last_account_fee_at: at });
+  if (!(await repo.chargeDailyAccountFee(account.user_id, utcDayStart(at), at))) return false;
+  const frozen = account.status === 'frozen';
+  account.balance -= frozen ? FROZEN_ACCOUNT_FEE_CENTS : DAILY_ACCOUNT_FEE_CENTS;
   account.last_account_fee_at = at;
   return true;
+}
+
+// Every day, no matter what: the scheduled handler sweeps every account.
+// Interaction entry points keep calling the per-account version above as a
+// backstop: a missed cron run or a failed account lands on that account's
+// next interaction. A day where neither the cron nor any interaction happens
+// is skipped for that account; there is no retroactive catch-up. One bad
+// account never blocks the rest of the sweep, and cron events are not
+// retried.
+export async function applyDailyAccountFees(repo) {
+  let charged = 0;
+  let failed = 0;
+  for (const account of await repo.listAllAccounts()) {
+    try {
+      if (await applyDailyAccountFee(repo, account)) charged++;
+    } catch (error) {
+      failed++;
+      console.error('daily account fee failed for account', account.user_id, error);
+    }
+  }
+  return { charged, failed };
 }
 
 async function credit(repo, account, amount, kind, description) {
@@ -280,6 +308,20 @@ export function createMemoryRepo() {
         const user = users.get(row.user_id);
         return { ...row, name: user?.name || null, slack_user_id: user?.slack_user_id || null };
       });
+    },
+    async chargeDailyAccountFee(userId, dayStart, at) {
+      const account = accounts.get(userId);
+      if (!account) return false;
+      if (account.last_account_fee_at != null && account.last_account_fee_at >= dayStart) return false;
+      const frozen = account.status === 'frozen';
+      const fee = frozen ? FROZEN_ACCOUNT_FEE_CENTS : DAILY_ACCOUNT_FEE_CENTS;
+      accounts.set(userId, { ...account, balance: account.balance - fee, last_account_fee_at: at, last_fee_at: at, updated_at: at });
+      transactions.push({ id: id(), user_id: userId, amount: -fee, kind: 'fee',
+        description: frozen ? FROZEN_ACCOUNT_FEE_DESCRIPTION : DAILY_ACCOUNT_FEE_DESCRIPTION, created_at: at });
+      return true;
+    },
+    async listAllAccounts() {
+      return [...accounts.values()].map(account => ({ ...account, inventory: [...parseInventory(account.inventory)] }));
     },
     async addTxn(row) { transactions.push({ id: id(), ...row }); },
     async listTxns(userId, limit) {
@@ -400,6 +442,27 @@ export function createD1Repo(db) {
       const order = direction === 'asc' ? 'ASC' : 'DESC';
       return all(`SELECT accounts.user_id, accounts.balance, accounts.status, accounts.tier, accounts.account_number, users.name, users.slack_user_id
         FROM accounts JOIN users ON users.id = accounts.user_id ORDER BY accounts.balance ${order} LIMIT ?`, limit);
+    },
+    // Claim, debit and ledger row in one all-or-nothing batch. The ledger
+    // INSERT runs first on the not-yet-claimed predicate: when the fee was
+    // already taken today (by the sweep or an interaction), both statements
+    // no-op; when it is due, both land. The frozen rate is read from the
+    // account row inside the same transaction, so it cannot race a status
+    // change.
+    async chargeDailyAccountFee(userId, dayStart, at) {
+      const due = `(last_account_fee_at IS NULL OR last_account_fee_at < ${Number(dayStart)})`;
+      const fee = `CASE WHEN status = 'frozen' THEN ${FROZEN_ACCOUNT_FEE_CENTS} ELSE ${DAILY_ACCOUNT_FEE_CENTS} END`;
+      const description = `CASE WHEN status = 'frozen' THEN '${FROZEN_ACCOUNT_FEE_DESCRIPTION}' ELSE '${DAILY_ACCOUNT_FEE_DESCRIPTION}' END`;
+      const results = await db.batch([
+        db.prepare(`INSERT INTO transactions (user_id, amount, kind, description, created_at)
+          SELECT user_id, -${fee}, 'fee', ${description}, ? FROM accounts WHERE user_id = ? AND ${due}`).bind(at, userId),
+        db.prepare(`UPDATE accounts SET balance = balance - ${fee}, last_account_fee_at = ?, last_fee_at = ?, updated_at = ?
+          WHERE user_id = ? AND ${due}`).bind(at, at, at, userId),
+      ]);
+      return (results[1].meta?.changes ?? 0) > 0;
+    },
+    async listAllAccounts() {
+      return (await all('SELECT * FROM accounts')).map(parseAccount);
     },
     async addTxn(row) {
       await run('INSERT INTO transactions (user_id, amount, kind, description, created_at) VALUES (?, ?, ?, ?, ?)',
